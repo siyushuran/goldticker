@@ -13,3 +13,6 @@ GoldTickerData/
 # 系统
 Thumbs.db
 desktop.ini
+
+# 本地附件缓存
+.loomy-attachments/
