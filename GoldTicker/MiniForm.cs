@@ -11,7 +11,7 @@ public enum DockEdge { Left, Right }
 
 /// <summary>
 /// 贴边收起后的悬浮小窗：无边框、置顶、两行价格（上国际 / 下国内）。
-/// 单击展开完整窗口；拖动可移动，拖离边缘则展开、拖到边缘则继续吸边。
+/// 单击或悬停都是临时展开完整窗口（3 秒后失焦自动收回）；拖动可移动，拖离边缘则展开、拖到边缘则继续吸边。
 /// </summary>
 public sealed class MiniForm : Form
 {
@@ -22,7 +22,7 @@ public sealed class MiniForm : Form
     [DllImport("dwmapi.dll")]
     private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
 
-    public event Action<bool>? ExpandRequested;   // true = 单击（保持展开）
+    public event Action? ExpandRequested;   // 单击 / 悬停都只是临时展开，失焦后由主窗自动收回
     public event Action<Point>? MovedByUser;
 
     [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
@@ -214,7 +214,7 @@ public sealed class MiniForm : Form
         _hoverTimer?.Stop();
         if (!IsHandleCreated || IsDisposed) return;
         if (!ClientRectangle.Contains(PointToClient(Cursor.Position))) return;
-        ExpandRequested?.Invoke(false);
+        ExpandRequested?.Invoke();
     }
 
     protected override void OnMouseLeave(EventArgs e)
@@ -260,7 +260,7 @@ public sealed class MiniForm : Form
         _hoverTimer?.Stop();
 
         if (_dragging) MovedByUser?.Invoke(Location);
-        else ExpandRequested?.Invoke(true);
+        else ExpandRequested?.Invoke();
     }
 
     protected override void Dispose(bool disposing)

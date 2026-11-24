@@ -35,6 +35,9 @@ public sealed class MainForm : Form
     [DllImport("user32.dll")]
     private static extern bool IsWindowVisible(IntPtr hWnd);
 
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetForegroundWindow();
+
     private const int SW_SHOWNORMAL = 1;
 
     private readonly QuoteFetcher _fetcher = new();
@@ -83,6 +86,14 @@ public sealed class MainForm : Form
     private Rectangle _restoreBounds;
     private readonly System.Windows.Forms.Timer _dockTimer;
     private DateTime _dockEnabledAt = DateTime.MaxValue;
+
+    // 悬浮小窗单击或悬停后「临时展开」：3 秒宽限期内保持，之后鼠标离开 / 窗口失焦就收回悬浮小窗
+    private DockEdge _miniEdge = DockEdge.Left;
+    private bool _tempMode;
+    private DateTime _tempDeadline = DateTime.MinValue;
+    private bool _tempHadFocus;
+    private bool _tempLostFocus;
+    private readonly System.Windows.Forms.Timer _tempTimer;
 
     public MainForm()
     {
@@ -161,6 +172,20 @@ public sealed class MainForm : Form
         };
         LocationChanged += (_, _) => QueueDockCheck();
         SizeChanged += (_, _) => QueueDockCheck();
+
+        _tempTimer = new System.Windows.Forms.Timer { Interval = 120 };
+        _tempTimer.Tick += OnTempTick;
+
+        Activated += (_, _) =>
+        {
+            if (!_tempMode) return;
+            _tempHadFocus = true;
+            _tempLostFocus = false;
+        };
+        Deactivate += (_, _) =>
+        {
+            if (_tempMode && _tempHadFocus) _tempLostFocus = true;
+        };
     }
 
     private void QueueDockCheck()
@@ -234,6 +259,7 @@ public sealed class MainForm : Form
         SaveState();
         UnregisterHotKey(Handle, HotkeyId);
         _uiTimer.Stop();
+        _tempTimer.Stop();
         if (_mini != null)
         {
             _mini.Dispose();
@@ -248,6 +274,7 @@ public sealed class MainForm : Form
     {
         if (disposing)
         {
+            _tempTimer?.Dispose();
             _fLabel.Dispose();
             _fSmall.Dispose();
             _fTick.Dispose();
@@ -369,12 +396,18 @@ public sealed class MainForm : Form
         else if (Bounds.Right >= wa.Right - d) CollapseToMini(DockEdge.Right);
     }
 
-    private void CollapseToMini(DockEdge edge)
+    private void CollapseToMini(DockEdge edge) => CollapseToMini(edge, Bounds);
+
+    private void CollapseToMini(DockEdge edge, Rectangle anchor)
     {
         if (_mini != null) return;
 
-        var wa = Screen.FromControl(this).WorkingArea;
-        _restoreBounds = Bounds;
+        CancelTempExpand();
+        _dockTimer.Stop();
+
+        var wa = Screen.FromRectangle(anchor).WorkingArea;
+        _restoreBounds = anchor;
+        _miniEdge = edge;
 
         var mini = new MiniForm
         {
@@ -384,7 +417,7 @@ public sealed class MainForm : Form
         mini.SetQuotes(_intl, _dom);
         mini.ExpandRequested += OnMiniExpand;
         mini.MovedByUser += OnMiniMoved;
-        mini.DockTo(wa, edge, _restoreBounds);
+        mini.DockTo(wa, edge, anchor);
         mini.Show();
 
         _mini = mini;
@@ -393,7 +426,8 @@ public sealed class MainForm : Form
         Log.Write("collapsed to mini (" + edge + ")");
     }
 
-    private void OnMiniExpand(bool pinned) => ExpandFromMini(pinned);
+    /// <summary>单击 / 悬停悬浮小窗：都是临时展开完整窗口（3 秒后失焦自动收回）。</summary>
+    private void OnMiniExpand() => ExpandFromMini(true, true);
 
     private void OnMiniMoved(Point location)
     {
@@ -408,12 +442,17 @@ public sealed class MainForm : Form
         _restoreBounds = new Rectangle(location.X, location.Y, _restoreBounds.Width, _restoreBounds.Height);
 
         if (nearLeft || nearRight)
-            mini.DockTo(wa, nearLeft ? DockEdge.Left : DockEdge.Right, mini.Bounds);
+        {
+            _miniEdge = nearLeft ? DockEdge.Left : DockEdge.Right;
+            mini.DockTo(wa, _miniEdge, mini.Bounds);
+        }
         else
+        {
             ExpandFromMini(true);
+        }
     }
 
-    private void ExpandFromMini(bool pinned)
+    private void ExpandFromMini(bool pinned, bool temporary = false)
     {
         var mini = _mini;
         if (mini == null) return;
@@ -451,11 +490,76 @@ public sealed class MainForm : Form
         Show();
         TopMost = _cfg.TopMost;
         ForceShow();
-        Log.Write("expanded from mini, pinned=" + pinned);
+        Log.Write("expanded from mini, pinned=" + pinned + (temporary ? ", temporary" : ""));
+
+        if (temporary) BeginTempExpand();
+        else CancelTempExpand();
+    }
+
+    // ------------------------------------------------------------------ 临时展开（单击 / 悬停小窗）
+
+    private void BeginTempExpand()
+    {
+        _tempMode = true;
+        _tempHadFocus = IsSelfForeground() || ContainsFocus;
+        _tempLostFocus = false;
+        _tempDeadline = DateTime.Now.AddSeconds(3);
+        _tempTimer.Start();
+    }
+
+    private void CancelTempExpand()
+    {
+        _tempMode = false;
+        _tempTimer.Stop();
+    }
+
+    private void OnTempTick(object? sender, EventArgs e)
+    {
+        if (!_tempMode || _mini != null)
+        {
+            _tempTimer.Stop();
+            return;
+        }
+
+        if (!Visible)
+        {
+            CancelTempExpand();
+            return;
+        }
+
+        if (DateTime.Now < _tempDeadline) return;   // 3 秒宽限期，刚展开时鼠标多半还在卡片上
+
+        var cursorInside = Bounds.Contains(Cursor.Position);
+        var focused = IsSelfForeground() || ContainsFocus;
+
+        // 鼠标离开窗口，或窗口失去前台焦点，就收回悬浮小窗
+        if (!cursorInside || (_tempHadFocus && _tempLostFocus && !focused))
+        {
+            Log.Write("temp collapse: inside=" + cursorInside + " hadFocus=" + _tempHadFocus +
+                      " lost=" + _tempLostFocus + " focused=" + focused);
+            CollapseFromTemp();
+        }
+    }
+
+    private void CollapseFromTemp()
+    {
+        CancelTempExpand();
+        if (_mini != null) return;
+
+        // 回到展开前的锚点，而不是临时窗口此刻的位置
+        CollapseToMini(_miniEdge, _restoreBounds);
+        Log.Write("temp expand ended, back to mini");
+    }
+
+    private bool IsSelfForeground()
+    {
+        if (!IsHandleCreated) return false;
+        try { return GetForegroundWindow() == Handle; } catch { return false; }
     }
 
     private void HideToTray()
     {
+        CancelTempExpand();
         Hide();
         var tip = _hotkeyOk ? "已隐藏到托盘，" + _cfg.Hotkey + " 可唤出" : "已隐藏到托盘，可从托盘图标恢复";
         try { _tray.ShowBalloonTip(1800, "金价", tip, ToolTipIcon.None); } catch { }
@@ -1256,6 +1360,7 @@ public sealed class MainForm : Form
     private void OpenSettings()
     {
         if (_docked) ExpandFromMini(true);
+        CancelTempExpand();   // 设置对话框是模态的，别在它打开时把窗口收回小窗
 
         using var dialog = new SettingsForm(_cfg, _hotkeyOk);
 
